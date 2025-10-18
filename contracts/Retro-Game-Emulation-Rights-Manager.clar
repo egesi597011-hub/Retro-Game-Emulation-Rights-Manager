@@ -7,10 +7,16 @@
 (define-constant ERR_INVALID_LICENSE_TYPE (err u105))
 (define-constant ERR_LICENSE_EXPIRED (err u106))
 (define-constant ERR_INSUFFICIENT_BALANCE (err u107))
+(define-constant ERR_INVALID_PRICE_ADJUSTMENT (err u108))
+(define-constant MAX_PRICE_MULTIPLIER u300)
+(define-constant MIN_PRICE_MULTIPLIER u50)
+(define-constant DEMAND_THRESHOLD_HIGH u10)
+(define-constant DEMAND_THRESHOLD_LOW u3)
 
 (define-data-var contract-enabled bool true)
 (define-data-var total-games uint u0)
 (define-data-var platform-fee-rate uint u250)
+(define-data-var pricing-window-blocks uint u1440)
 
 (define-map games
   { game-id: uint }
@@ -63,6 +69,38 @@
 
 (define-data-var next-session-id uint u1)
 
+(define-map game-demand-metrics
+  { game-id: uint }
+  {
+    plays-last-window: uint,
+    window-start-block: uint,
+    peak-concurrent-sessions: uint,
+    total-unique-players: uint,
+    average-session-duration: uint,
+    current-price-multiplier: uint
+  }
+)
+
+(define-map game-price-history
+  { game-id: uint, block-height: uint }
+  {
+    price: uint,
+    multiplier: uint,
+    plays-count: uint,
+    reason: (string-ascii 32)
+  }
+)
+
+(define-map player-game-stats
+  { player: principal, game-id: uint }
+  {
+    total-plays: uint,
+    last-played: uint,
+    total-spent: uint,
+    average-session-duration: uint
+  }
+)
+
 (define-public (register-game 
   (title (string-ascii 64))
   (publisher principal)
@@ -99,6 +137,17 @@
           (default-to { total-earned: u0, games-count: u0, withdrawn: u0 }
             (map-get? developer-earnings { developer: tx-sender }))) u1) }))
     
+    (map-set game-demand-metrics
+      { game-id: game-id }
+      {
+        plays-last-window: u0,
+        window-start-block: stacks-block-height,
+        peak-concurrent-sessions: u0,
+        total-unique-players: u0,
+        average-session-duration: u0,
+        current-price-multiplier: u100
+      })
+    
     (var-set total-games game-id)
     (ok game-id)))
 
@@ -133,7 +182,9 @@
 (define-public (play-game (game-id uint))
   (let ((game (unwrap! (map-get? games { game-id: game-id }) ERR_GAME_NOT_FOUND))
         (license (map-get? game-licenses { licensee: tx-sender, game-id: game-id }))
-        (play-cost (get play-cost game))
+        (base-cost (get play-cost game))
+        (dynamic-cost (calculate-dynamic-price game-id))
+        (play-cost (if (> dynamic-cost u0) dynamic-cost base-cost))
         (session-id (var-get next-session-id)))
     
     (asserts! (var-get contract-enabled) ERR_NOT_AUTHORIZED)
@@ -171,6 +222,7 @@
       })
     
     (var-set next-session-id (+ session-id u1))
+    (unwrap-panic (update-demand-metrics game-id tx-sender (if (is-some license) u0 play-cost)))
     (ok session-id)))
 
 (define-public (end-play-session (session-id uint) (duration uint))
@@ -238,6 +290,41 @@
     (var-set contract-enabled enabled)
     (ok true)))
 
+(define-public (update-pricing-window (new-window-blocks uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (asserts! (and (>= new-window-blocks u144) (<= new-window-blocks u14400)) ERR_INVALID_PRICE_ADJUSTMENT)
+    (var-set pricing-window-blocks new-window-blocks)
+    (ok true)))
+
+(define-public (manual-price-adjustment (game-id uint) (multiplier uint) (reason (string-ascii 32)))
+  (let ((game (unwrap! (map-get? games { game-id: game-id }) ERR_GAME_NOT_FOUND)))
+    (asserts! (is-eq tx-sender (get developer game)) ERR_NOT_AUTHORIZED)
+    (asserts! (and (>= multiplier MIN_PRICE_MULTIPLIER) (<= multiplier MAX_PRICE_MULTIPLIER)) ERR_INVALID_PRICE_ADJUSTMENT)
+    
+    (let ((metrics (default-to {
+                     plays-last-window: u0,
+                     window-start-block: stacks-block-height,
+                     peak-concurrent-sessions: u0,
+                     total-unique-players: u0,
+                     average-session-duration: u0,
+                     current-price-multiplier: u100
+                   } (map-get? game-demand-metrics { game-id: game-id }))))
+      
+      (map-set game-demand-metrics
+        { game-id: game-id }
+        (merge metrics { current-price-multiplier: multiplier }))
+      
+      (map-set game-price-history
+        { game-id: game-id, block-height: stacks-block-height }
+        {
+          price: (/ (* (get play-cost game) multiplier) u100),
+          multiplier: multiplier,
+          plays-count: (get total-plays game),
+          reason: reason
+        }))
+    (ok true)))
+
 (define-read-only (get-game (game-id uint))
   (map-get? games { game-id: game-id }))
 
@@ -261,6 +348,37 @@
 
 (define-read-only (is-contract-enabled)
   (var-get contract-enabled))
+
+(define-read-only (get-game-demand-metrics (game-id uint))
+  (map-get? game-demand-metrics { game-id: game-id }))
+
+(define-read-only (get-game-price-history (game-id uint) (target-block uint))
+  (map-get? game-price-history { game-id: game-id, block-height: target-block }))
+
+(define-read-only (get-player-game-stats (player principal) (game-id uint))
+  (map-get? player-game-stats { player: player, game-id: game-id }))
+
+(define-read-only (get-current-game-price (game-id uint))
+  (let ((game (map-get? games { game-id: game-id }))
+        (metrics (map-get? game-demand-metrics { game-id: game-id })))
+    (match game
+      game-data
+        (match metrics
+          demand-data
+            (let ((base-price (get play-cost game-data))
+                  (multiplier (get current-price-multiplier demand-data)))
+              (/ (* base-price multiplier) u100))
+          (get play-cost game-data))
+      u0)))
+
+(define-read-only (get-pricing-window)
+  (var-get pricing-window-blocks))
+
+(define-read-only (get-game-popularity-score (game-id uint))
+  (let ((metrics (map-get? game-demand-metrics { game-id: game-id })))
+    (match metrics
+      demand-data (+ (get plays-last-window demand-data) (get total-unique-players demand-data))
+      u0)))
 
 (define-read-only (calculate-license-cost 
   (game-id uint)
@@ -311,4 +429,84 @@
       (let ((current (default-to { total-earned: u0, games-count: u0, withdrawn: u0 }
                        (map-get? publisher-earnings { publisher: (get publisher game) }))))
         (merge current { total-earned: (+ (get total-earned current) publisher-share) })))
+    (ok true)))
+
+(define-private (calculate-dynamic-price (game-id uint))
+  (let ((game (map-get? games { game-id: game-id }))
+        (metrics (map-get? game-demand-metrics { game-id: game-id })))
+    (match game
+      game-data
+        (match metrics
+          demand-data
+            (let ((base-price (get play-cost game-data))
+                  (multiplier (calculate-demand-multiplier game-id demand-data)))
+              (/ (* base-price multiplier) u100))
+          (get play-cost game-data))
+      u0)))
+
+(define-private (calculate-demand-multiplier (game-id uint) (metrics { plays-last-window: uint, window-start-block: uint, peak-concurrent-sessions: uint, total-unique-players: uint, average-session-duration: uint, current-price-multiplier: uint }))
+  (let ((window-blocks (var-get pricing-window-blocks))
+        (blocks-since-window-start (- stacks-block-height (get window-start-block metrics)))
+        (plays-in-window (get plays-last-window metrics)))
+    
+    (if (>= blocks-since-window-start window-blocks)
+      (begin
+        (unwrap-panic (reset-demand-window game-id))
+        u100)
+      (if (>= plays-in-window DEMAND_THRESHOLD_HIGH)
+        (let ((new-multiplier (+ (get current-price-multiplier metrics) u25)))
+          (if (<= new-multiplier MAX_PRICE_MULTIPLIER) new-multiplier MAX_PRICE_MULTIPLIER))
+        (if (<= plays-in-window DEMAND_THRESHOLD_LOW)
+          (let ((new-multiplier (- (get current-price-multiplier metrics) u15)))
+            (if (>= new-multiplier MIN_PRICE_MULTIPLIER) new-multiplier MIN_PRICE_MULTIPLIER))
+          (get current-price-multiplier metrics))))))
+
+(define-private (update-demand-metrics (game-id uint) (player principal) (amount-paid uint))
+  (let ((current-metrics (default-to {
+                           plays-last-window: u0,
+                           window-start-block: stacks-block-height,
+                           peak-concurrent-sessions: u0,
+                           total-unique-players: u0,
+                           average-session-duration: u0,
+                           current-price-multiplier: u100
+                         } (map-get? game-demand-metrics { game-id: game-id })))
+        (player-stats (map-get? player-game-stats { player: player, game-id: game-id }))
+        (is-new-player (is-none player-stats)))
+    
+    (let ((new-plays (+ (get plays-last-window current-metrics) u1))
+          (new-multiplier (if (>= new-plays DEMAND_THRESHOLD_HIGH)
+                            (let ((mult (+ (get current-price-multiplier current-metrics) u25)))
+                              (if (<= mult MAX_PRICE_MULTIPLIER) mult MAX_PRICE_MULTIPLIER))
+                            (if (<= new-plays DEMAND_THRESHOLD_LOW)
+                              (let ((mult (- (get current-price-multiplier current-metrics) u15)))
+                                (if (>= mult MIN_PRICE_MULTIPLIER) mult MIN_PRICE_MULTIPLIER))
+                              (get current-price-multiplier current-metrics)))))
+      (map-set game-demand-metrics
+        { game-id: game-id }
+        (merge current-metrics {
+          plays-last-window: new-plays,
+          total-unique-players: (if is-new-player
+                                 (+ (get total-unique-players current-metrics) u1)
+                                 (get total-unique-players current-metrics)),
+          current-price-multiplier: new-multiplier
+        })))
+    
+    (map-set player-game-stats
+      { player: player, game-id: game-id }
+      (let ((current-stats (default-to { total-plays: u0, last-played: u0, total-spent: u0, average-session-duration: u0 } player-stats)))
+        (merge current-stats {
+          total-plays: (+ (get total-plays current-stats) u1),
+          last-played: stacks-block-height,
+          total-spent: (+ (get total-spent current-stats) amount-paid)
+        })))
+    (ok true)))
+
+(define-private (reset-demand-window (game-id uint))
+  (let ((current-metrics (unwrap! (map-get? game-demand-metrics { game-id: game-id }) (ok false))))
+    (map-set game-demand-metrics
+      { game-id: game-id }
+      (merge current-metrics {
+        plays-last-window: u0,
+        window-start-block: stacks-block-height
+      }))
     (ok true)))
