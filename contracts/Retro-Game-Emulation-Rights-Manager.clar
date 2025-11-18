@@ -17,6 +17,7 @@
 (define-data-var total-games uint u0)
 (define-data-var platform-fee-rate uint u250)
 (define-data-var pricing-window-blocks uint u1440)
+(define-data-var platform-fee-balance uint u0)
 
 (define-map games
   { game-id: uint }
@@ -239,9 +240,7 @@
   (let ((earnings-data (unwrap! (map-get? developer-earnings { developer: tx-sender }) ERR_NOT_AUTHORIZED))
         (available (- (get total-earned earnings-data) (get withdrawn earnings-data))))
     (asserts! (> available u0) ERR_INSUFFICIENT_BALANCE)
-    
     (try! (as-contract (stx-transfer? available tx-sender tx-sender)))
-    
     (map-set developer-earnings
       { developer: tx-sender }
       (merge earnings-data { withdrawn: (get total-earned earnings-data) }))
@@ -251,13 +250,19 @@
   (let ((earnings-data (unwrap! (map-get? publisher-earnings { publisher: tx-sender }) ERR_NOT_AUTHORIZED))
         (available (- (get total-earned earnings-data) (get withdrawn earnings-data))))
     (asserts! (> available u0) ERR_INSUFFICIENT_BALANCE)
-    
     (try! (as-contract (stx-transfer? available tx-sender tx-sender)))
-    
     (map-set publisher-earnings
       { publisher: tx-sender }
       (merge earnings-data { withdrawn: (get total-earned earnings-data) }))
     (ok available)))
+
+(define-public (withdraw-platform-fees)
+  (let ((amount (var-get platform-fee-balance)))
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (asserts! (> amount u0) ERR_INSUFFICIENT_BALANCE)
+    (try! (as-contract (stx-transfer? amount tx-sender tx-sender)))
+    (var-set platform-fee-balance u0)
+    (ok amount)))
 
 (define-public (update-game-status (game-id uint) (is-active bool))
   (let ((game (unwrap! (map-get? games { game-id: game-id }) ERR_GAME_NOT_FOUND)))
@@ -346,6 +351,9 @@
 (define-read-only (get-platform-fee-rate)
   (var-get platform-fee-rate))
 
+(define-read-only (get-platform-fee-balance)
+  (var-get platform-fee-balance))
+
 (define-read-only (is-contract-enabled)
   (var-get contract-enabled))
 
@@ -398,13 +406,12 @@
         (remaining (- amount platform-fee))
         (developer-share (/ (* remaining (get royalty-rate game)) u10000))
         (publisher-share (- remaining developer-share)))
-    
+    (var-set platform-fee-balance (+ (var-get platform-fee-balance) platform-fee))
     (map-set developer-earnings
       { developer: (get developer game) }
       (let ((current (default-to { total-earned: u0, games-count: u0, withdrawn: u0 }
                        (map-get? developer-earnings { developer: (get developer game) }))))
         (merge current { total-earned: (+ (get total-earned current) developer-share) })))
-    
     (map-set publisher-earnings
       { publisher: (get publisher game) }
       (let ((current (default-to { total-earned: u0, games-count: u0, withdrawn: u0 }
@@ -417,13 +424,12 @@
         (remaining (- amount platform-fee))
         (developer-share (/ (* remaining (get royalty-rate game)) u10000))
         (publisher-share (- remaining developer-share)))
-    
+    (var-set platform-fee-balance (+ (var-get platform-fee-balance) platform-fee))
     (map-set developer-earnings
       { developer: (get developer game) }
       (let ((current (default-to { total-earned: u0, games-count: u0, withdrawn: u0 }
                        (map-get? developer-earnings { developer: (get developer game) }))))
         (merge current { total-earned: (+ (get total-earned current) developer-share) })))
-    
     (map-set publisher-earnings
       { publisher: (get publisher game) }
       (let ((current (default-to { total-earned: u0, games-count: u0, withdrawn: u0 }
