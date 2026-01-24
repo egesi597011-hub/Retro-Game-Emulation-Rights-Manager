@@ -8,6 +8,9 @@
 (define-constant ERR_LICENSE_EXPIRED (err u106))
 (define-constant ERR_INSUFFICIENT_BALANCE (err u107))
 (define-constant ERR_INVALID_PRICE_ADJUSTMENT (err u108))
+(define-constant ERR_ALREADY_RATED (err u109))
+(define-constant ERR_INVALID_RATING (err u110))
+(define-constant ERR_MUST_PLAY_FIRST (err u111))
 (define-constant MAX_PRICE_MULTIPLIER u300)
 (define-constant MIN_PRICE_MULTIPLIER u50)
 (define-constant DEMAND_THRESHOLD_HIGH u10)
@@ -100,6 +103,34 @@
     total-spent: uint,
     average-session-duration: uint
   }
+)
+
+(define-map game-ratings
+  { game-id: uint }
+  {
+    total-ratings: uint,
+    sum-ratings: uint,
+    five-star-count: uint,
+    four-star-count: uint,
+    three-star-count: uint,
+    two-star-count: uint,
+    one-star-count: uint
+  }
+)
+
+(define-map player-reviews
+  { player: principal, game-id: uint }
+  {
+    rating: uint,
+    review-text: (string-ascii 256),
+    submitted-at: uint,
+    helpful-votes: uint
+  }
+)
+
+(define-map review-votes
+  { voter: principal, reviewer: principal, game-id: uint }
+  { voted: bool }
 )
 
 (define-public (register-game 
@@ -330,6 +361,65 @@
         }))
     (ok true)))
 
+(define-public (submit-review (game-id uint) (rating uint) (review-text (string-ascii 256)))
+  (let ((game (unwrap! (map-get? games { game-id: game-id }) ERR_GAME_NOT_FOUND))
+        (player-stats (map-get? player-game-stats { player: tx-sender, game-id: game-id }))
+        (existing-review (map-get? player-reviews { player: tx-sender, game-id: game-id })))
+    
+    (asserts! (var-get contract-enabled) ERR_NOT_AUTHORIZED)
+    (asserts! (and (>= rating u1) (<= rating u5)) ERR_INVALID_RATING)
+    (asserts! (is-some player-stats) ERR_MUST_PLAY_FIRST)
+    (asserts! (is-none existing-review) ERR_ALREADY_RATED)
+    
+    (let ((current-ratings (default-to {
+                             total-ratings: u0,
+                             sum-ratings: u0,
+                             five-star-count: u0,
+                             four-star-count: u0,
+                             three-star-count: u0,
+                             two-star-count: u0,
+                             one-star-count: u0
+                           } (map-get? game-ratings { game-id: game-id }))))
+      
+      (map-set game-ratings
+        { game-id: game-id }
+        {
+          total-ratings: (+ (get total-ratings current-ratings) u1),
+          sum-ratings: (+ (get sum-ratings current-ratings) rating),
+          five-star-count: (if (is-eq rating u5) (+ (get five-star-count current-ratings) u1) (get five-star-count current-ratings)),
+          four-star-count: (if (is-eq rating u4) (+ (get four-star-count current-ratings) u1) (get four-star-count current-ratings)),
+          three-star-count: (if (is-eq rating u3) (+ (get three-star-count current-ratings) u1) (get three-star-count current-ratings)),
+          two-star-count: (if (is-eq rating u2) (+ (get two-star-count current-ratings) u1) (get two-star-count current-ratings)),
+          one-star-count: (if (is-eq rating u1) (+ (get one-star-count current-ratings) u1) (get one-star-count current-ratings))
+        }))
+    
+    (map-set player-reviews
+      { player: tx-sender, game-id: game-id }
+      {
+        rating: rating,
+        review-text: review-text,
+        submitted-at: stacks-block-height,
+        helpful-votes: u0
+      })
+    (ok true)))
+
+(define-public (vote-review-helpful (reviewer principal) (game-id uint))
+  (let ((review (unwrap! (map-get? player-reviews { player: reviewer, game-id: game-id }) ERR_GAME_NOT_FOUND))
+        (existing-vote (map-get? review-votes { voter: tx-sender, reviewer: reviewer, game-id: game-id })))
+    
+    (asserts! (var-get contract-enabled) ERR_NOT_AUTHORIZED)
+    (asserts! (is-none existing-vote) ERR_ALREADY_RATED)
+    (asserts! (not (is-eq tx-sender reviewer)) ERR_NOT_AUTHORIZED)
+    
+    (map-set player-reviews
+      { player: reviewer, game-id: game-id }
+      (merge review { helpful-votes: (+ (get helpful-votes review) u1) }))
+    
+    (map-set review-votes
+      { voter: tx-sender, reviewer: reviewer, game-id: game-id }
+      { voted: true })
+    (ok true)))
+
 (define-read-only (get-game (game-id uint))
   (map-get? games { game-id: game-id }))
 
@@ -387,6 +477,24 @@
     (match metrics
       demand-data (+ (get plays-last-window demand-data) (get total-unique-players demand-data))
       u0)))
+
+(define-read-only (get-game-ratings (game-id uint))
+  (map-get? game-ratings { game-id: game-id }))
+
+(define-read-only (get-player-review (player principal) (game-id uint))
+  (map-get? player-reviews { player: player, game-id: game-id }))
+
+(define-read-only (get-game-average-rating (game-id uint))
+  (let ((ratings (map-get? game-ratings { game-id: game-id })))
+    (match ratings
+      rating-data
+        (if (> (get total-ratings rating-data) u0)
+          (/ (* (get sum-ratings rating-data) u100) (get total-ratings rating-data))
+          u0)
+      u0)))
+
+(define-read-only (has-player-reviewed (player principal) (game-id uint))
+  (is-some (map-get? player-reviews { player: player, game-id: game-id })))
 
 (define-read-only (calculate-license-cost 
   (game-id uint)
